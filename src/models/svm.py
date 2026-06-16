@@ -2,30 +2,37 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
+from sklearn.metrics import accuracy_score
 
 
 class _Svm(nn.Module):
-    """Internal module containing the trainable SVM parameters."""
+    """Internal module containing the trainable parameters of a binary SVM."""
 
     def __init__(self, num_samples):
         super().__init__()
-        # 'v' represents the coefficients for each support vector
         self.v = mx.zeros((num_samples,))
-        # 'b' represents the bias
         self.b = mx.zeros((1,))
 
     def __call__(self, K):
-        # Prediction equation in the kernel space: K @ v + b
         return K @ self.v + self.b
 
 
 class SVC:
-    """Support Vector Machine classifier implemented.
+    """Binary SVM implemented in MLX.
 
-    Designed with a scikit-learn style API.
+    Maintained as the base classifier for multi-class strategies.
+    For multi-class MNIST, use OneVsOneSVC instead.
     """
 
-    def __init__(self, C=1.0, kernel="rbf", gamma=0.1, degree=3, lr=0.01, epochs=1000):
+    def __init__(
+        self,
+        C=1.0,
+        kernel="rbf",
+        gamma=0.1,
+        degree=3,
+        lr=0.01,
+        epochs=1000,
+    ):
         self.C = C
         self.kernel_type = kernel
         self.gamma = gamma
@@ -34,142 +41,316 @@ class SVC:
         self.epochs = epochs
 
         self.model = None
+        self.optimizer = None
+        self.loss_and_grad_fn = None
         self.X_train = None
+        self.y_train = None
+        self.K_train = None
+        self.history = {"loss": [], "accuracy": []}
 
     def _compute_kernel(self, X1, X2):
-        """Vectorized implementation of kernel tricks."""
+        """Vectorized kernel implementations."""
         if self.kernel_type == "linear":
             return X1 @ X2.T
 
-        elif self.kernel_type == "poly":
-            # K(x, y) = (gamma * <x, y> + 1)^degree
+        if self.kernel_type == "poly":
             return (self.gamma * (X1 @ X2.T) + 1.0) ** self.degree
 
-        elif self.kernel_type == "rbf":
-            # K(x, y) = exp(-gamma * ||x - y||^2)
-            # Binomial expansion for matrix optimization
+        if self.kernel_type == "rbf":
             X1_sq = mx.sum(X1**2, axis=1, keepdims=True)
             X2_sq = mx.sum(X2**2, axis=1)
             squared_distances = X1_sq + X2_sq - 2.0 * (X1 @ X2.T)
             return mx.exp(-self.gamma * squared_distances)
 
-        elif self.kernel_type == "sigmoid":
-            # K(x, y) = tanh(gamma * <x, y> + coef0)
-            # Note: self.coef0 would need to be added to __init__ (usually 0.0)
+        if self.kernel_type == "sigmoid":
             coef0 = 0.0
             return mx.tanh(self.gamma * (X1 @ X2.T) + coef0)
 
-        elif self.kernel_type == "laplacian":
-            # K(x, y) = exp(-gamma * ||x - y||_1)
-            # Compute Manhattan Distance (L1) using broadcasting
-
-            # Expand dimensions to compare each point against all others
-            # X1 becomes (N, 1, D) and X2 becomes (1, M, D)
+        if self.kernel_type == "laplacian":
             X1_exp = mx.expand_dims(X1, 1)
             X2_exp = mx.expand_dims(X2, 0)
-
-            # Sum of absolute differences
             l1_distance = mx.sum(mx.abs(X1_exp - X2_exp), axis=-1)
             return mx.exp(-self.gamma * l1_distance)
 
-        elif self.kernel_type == "cosine":
-            # K(x, y) = <x, y> / (||x|| * ||y||)
-            # Compute dot product
+        if self.kernel_type == "cosine":
             dot_product = X1 @ X2.T
-
-            # Compute vector norms (magnitudes)
             norm_X1 = mx.sqrt(mx.sum(X1**2, axis=1, keepdims=True))
             norm_X2 = mx.sqrt(mx.sum(X2**2, axis=1))
+            return dot_product / ((norm_X1 @ mx.expand_dims(norm_X2, 0)) + 1e-8)
 
-            # Multiply norms and divide
-            # Add 1e-8 to prevent division by zero
-            return dot_product / (
-                (norm_X1 @ mx.expand_dims(norm_X2, 0)) + 1e-8
-            )
-        else:
-            raise ValueError(f"Kernel '{self.kernel_type}' is not supported.")
+        raise ValueError(f"Kernel '{self.kernel_type}' is not supported.")
 
-    def decision_function(self, X):
-        """Return the raw continuous prediction values before applying the sign.
+    @staticmethod
+    def _loss_fn(model, K_mat, y_true, C_param):
+        """Hinge loss + lightweight L2 regularization."""
+        preds = model(K_mat)
+        errors = mx.maximum(0.0, 1.0 - y_true * preds)
+        hinge_loss = C_param * mx.mean(errors)
 
-        Crucial for breaking ties in One-vs-Rest strategies.
-        """
-        if self.model is None:
-            raise Exception("The model has not been trained.")
+        Kv = K_mat @ model.v
+        reg_loss = 0.5 * mx.mean(model.v * Kv)
 
-        X = mx.array(X)
-        K_test = self._compute_kernel(X, self.X_train)
-        preds = self.model(K_test)
+        return hinge_loss + reg_loss
 
-        # Convert the MLX tensor to a NumPy array and flatten it
-        return np.array(preds).flatten()
-
-    def fit(self, X, y):
-        """Fit the SVM model according to the given training data."""
-        # Data preparation (convert labels to -1 and 1)
-        X = mx.array(X)
-        y_np = np.where(np.array(y) <= 0, -1, 1)
+    def _prepare_training(self, X, y):
+        """Initialize internal state for epoch-based training."""
+        X = mx.array(X, dtype=mx.float32)
+        y_np = np.where(np.array(y) <= 0, -1, 1).astype(np.float32)
         y = mx.array(y_np, dtype=mx.float32)
 
         self.X_train = X
-        num_samples = X.shape[0]
+        self.y_train = y
+        self.K_train = self._compute_kernel(X, X)
 
-        # Precompute the training kernel matrix (K)
-        K = self._compute_kernel(X, X)
+        self.model = _Svm(X.shape[0])
+        self.optimizer = optim.Adam(learning_rate=self.lr)
+        self.loss_and_grad_fn = nn.value_and_grad(self.model, self._loss_fn)
 
-        # Initialize the MLX model and optimizer
-        self.model = _Svm(num_samples)
-        optimizer = optim.Adam(learning_rate=self.lr)
+        mx.eval(self.model.parameters(), self.K_train)
 
-        # Define the loss function (Regularization + Hinge Loss)
-        def loss_fn(model, K_mat, y_true, C_param):
-            """Compute the SVM loss combining Hinge Loss and light L2 regularization."""
-            # Predictions
-            preds = model(K_mat)
-
-            # Hinge Loss (the pure classification error)
-            errors = mx.maximum(0.0, 1.0 - y_true * preds)
-            hinge_loss = C_param * mx.mean(
-                errors
-            )  # Use mean to remain independent of dataset size
-
-            # Light L2 Regularization (prevents weights from exploding)
-            Kv = K_mat @ model.v
-            reg_loss = 0.5 * mx.mean(model.v * Kv)
-
-            # Return the combined loss sum
-            return hinge_loss + reg_loss
-
-        # Create the function that returns loss and gradients
-        loss_and_grad_fn = nn.value_and_grad(self.model, loss_fn)
-
-        # Training loop (Gradient Descent)
-        for epoch in range(self.epochs):
-            loss, grads = loss_and_grad_fn(self.model, K, y, self.C)
-            optimizer.update(self.model, grads)
-
-            # Lazy evaluation characteristic of MLX
-            mx.eval(self.model.parameters(), optimizer.state)
-
-            if epoch % 200 == 0 or epoch == self.epochs - 1:
-                print(f"Epoch {epoch:4d} | Loss: {loss.item():.4f}")
-
-        return self
-
-    def predict(self, X):
-        """Perform classification on samples in X."""
+    def train_epoch(self):
+        """Execute a single training epoch and return the loss value."""
         if self.model is None:
-            raise Exception(
-                "The model has not been trained yet. Call .fit() first."
+            raise RuntimeError("Call _prepare_training() before train_epoch().")
+
+        loss, grads = self.loss_and_grad_fn(
+            self.model,
+            self.K_train,
+            self.y_train,
+            self.C,
+        )
+        self.optimizer.update(self.model, grads)
+        mx.eval(self.model.parameters(), self.optimizer.state, loss)
+
+        return float(loss)
+
+    def fit(
+        self,
+        X,
+        y,
+        X_val=None,
+        y_val=None,
+        epochs=None,
+        eval_every=1,
+        verbose=True,
+    ):
+        """Train a binary SVM.
+
+        Returns
+        -------
+        dict
+            History dictionary with keys: ['loss', 'accuracy'].
+        """
+        if epochs is None:
+            epochs = self.epochs
+
+        self._prepare_training(X, y)
+        history = {"loss": [], "accuracy": []}
+        best_accuracy = 0.0
+
+        for epoch in range(1, epochs + 1):
+            loss = self.train_epoch()
+            history["loss"].append(loss)
+
+            should_eval = (
+                X_val is not None
+                and y_val is not None
+                and (epoch == 1 or epoch % eval_every == 0 or epoch == epochs)
             )
 
-        X = mx.array(X)
-        # Evaluate the kernel of the new data against the training data
+            if should_eval:
+                y_pred = self.predict(X_val)
+                y_true = np.where(np.array(y_val) <= 0, -1, 1)
+                accuracy = accuracy_score(y_true, y_pred)
+                best_accuracy = max(best_accuracy, accuracy)
+                history["accuracy"].append(float(accuracy))
+
+                if verbose:
+                    print(
+                        f"Epoch {epoch:4d}/{epochs} | "
+                        f"Loss: {loss:.4f} | "
+                        f"Accuracy: {accuracy:.4f} | "
+                        f"Best: {best_accuracy:.4f}"
+                    )
+            else:
+                history["accuracy"].append(np.nan)
+
+                if verbose:
+                    print(f"Epoch {epoch:4d}/{epochs} | Loss: {loss:.4f}")
+
+        self.history = history
+        return history
+
+    def decision_function(self, X):
+        """Return continuous decision scores before applying the sign function."""
+        if self.model is None:
+            raise RuntimeError("The model has not been trained.")
+
+        X = mx.array(X, dtype=mx.float32)
         K_test = self._compute_kernel(X, self.X_train)
-
-        # Predict using the model
         preds = self.model(K_test)
+        mx.eval(preds)
 
-        # Convert continuous predictions to classes (-1 or 1)
-        # and return as a NumPy array
-        return np.where(np.array(preds) >= 0, 1, -1)
+        return np.array(preds).flatten()
+
+    def predict(self, X):
+        """Binary classification: returns 1 or -1."""
+        scores = self.decision_function(X)
+        return np.where(scores >= 0, 1, -1)
+
+
+class OneVsOneSVC:
+    """Multi-class One-vs-One SVC for MNIST.
+
+    Trains a binary classifier for each unique pair of classes.
+    For MNIST, this yields 45 classifiers: C(10, 2).
+
+    Its fit method returns a history dataset comparable to the neural network:
+        dict_keys(['loss', 'accuracy'])
+
+    - loss: Average loss of the 45 estimators per epoch.
+    - accuracy: Ensembled multi-class accuracy over validation data.
+    """
+
+    def __init__(
+        self,
+        C=1.0,
+        kernel="rbf",
+        gamma=0.01,
+        degree=3,
+        lr=0.001,
+        epochs=100,
+    ):
+        self.C = C
+        self.kernel = kernel
+        self.gamma = gamma
+        self.degree = degree
+        self.lr = lr
+        self.epochs = epochs
+
+        self.classes_ = None
+        self.class_to_index_ = None
+        self.models = []
+        self.history = {"loss": [], "accuracy": []}
+
+    def _make_binary_model(self):
+        return SVC(
+            C=self.C,
+            kernel=self.kernel,
+            gamma=self.gamma,
+            degree=self.degree,
+            lr=self.lr,
+            epochs=self.epochs,
+        )
+
+    def _prepare_pair_models(self, X, y):
+        self.classes_ = np.unique(y)
+        self.class_to_index_ = {
+            label: idx for idx, label in enumerate(self.classes_)
+        }
+        self.models = []
+
+        for pos_idx, pos_class in enumerate(self.classes_):
+            for neg_class in self.classes_[pos_idx + 1 :]:
+                mask = (y == pos_class) | (y == neg_class)
+                X_pair = X[mask]
+                y_pair = np.where(y[mask] == pos_class, 1, -1)
+
+                model = self._make_binary_model()
+                model._prepare_training(X_pair, y_pair)
+
+                self.models.append((pos_class, neg_class, model))
+
+    def fit(
+        self,
+        X,
+        y,
+        X_val=None,
+        y_val=None,
+        epochs=None,
+        eval_every=1,
+        verbose=True,
+    ):
+        """Train the One-vs-One ensemble through synchronized epochs.
+
+        Returns
+        -------
+        dict
+            History dictionary with keys: ['loss', 'accuracy'].
+        """
+        if epochs is None:
+            epochs = self.epochs
+
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y)
+
+        if X_val is not None:
+            X_val = np.asarray(X_val, dtype=np.float32)
+        if y_val is not None:
+            y_val = np.asarray(y_val)
+
+        self._prepare_pair_models(X, y)
+
+        history = {"loss": [], "accuracy": []}
+        best_accuracy = 0.0
+
+        for epoch in range(1, epochs + 1):
+            epoch_losses = []
+
+            for _, _, model in self.models:
+                epoch_losses.append(model.train_epoch())
+
+            avg_loss = float(np.mean(epoch_losses))
+            history["loss"].append(avg_loss)
+
+            should_eval = (
+                X_val is not None
+                and y_val is not None
+                and (epoch == 1 or epoch % eval_every == 0 or epoch == epochs)
+            )
+
+            if should_eval:
+                y_pred = self.predict(X_val)
+                accuracy = accuracy_score(y_val, y_pred)
+                best_accuracy = max(best_accuracy, accuracy)
+                history["accuracy"].append(float(accuracy))
+
+                if verbose:
+                    print(
+                        f"Epoch {epoch:4d}/{epochs} | "
+                        f"Avg Loss: {avg_loss:.4f} | "
+                        f"Accuracy: {accuracy:.4f} | "
+                        f"Best: {best_accuracy:.4f}"
+                    )
+            else:
+                history["accuracy"].append(np.nan)
+
+                if verbose:
+                    print(
+                        f"Epoch {epoch:4d}/{epochs} | "
+                        f"Avg Loss: {avg_loss:.4f}"
+                    )
+
+        self.history = history
+        return history
+
+    def predict(self, X):
+        """Multi-class prediction using One-vs-One voting."""
+        if not self.models:
+            raise RuntimeError("The OneVsOneSVC model has not been trained.")
+
+        X = np.asarray(X, dtype=np.float32)
+        n_samples = len(X)
+        votes = np.zeros((n_samples, len(self.classes_)), dtype=np.float32)
+        row_idx = np.arange(n_samples)
+
+        for pos_class, neg_class, model in self.models:
+            preds = model.predict(X).flatten()
+
+            pos_col = self.class_to_index_[pos_class]
+            neg_col = self.class_to_index_[neg_class]
+
+            votes[row_idx[preds == 1], pos_col] += 1
+            votes[row_idx[preds == -1], neg_col] += 1
+
+        return self.classes_[np.argmax(votes, axis=1)]

@@ -30,16 +30,3 @@ def load_flatten_mnist(base_path="data/raw/"):
         np.array(x_test_flat),
         np.array(y_test_np)
     )
-
-def notificar_fin_entrenamiento(nombre_atajo: str = "ModeloTerminado") -> None:
-    """
-    Ejecuta un Atajo de macOS para enviar una notificación al ecosistema Apple.
-    """
-    try:
-        # Llama a la herramienta de línea de comandos de macOS 'shortcuts'
-        subprocess.run(["shortcuts", "run", nombre_atajo], check=True)
-        logging.info(f"Notificación enviada exitosamente vía el atajo: '{nombre_atajo}'")
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Error al intentar ejecutar el atajo: {e}")
-    except FileNotFoundError:
-        logging.error("El comando 'shortcuts' no está disponible en este sistema.")
