@@ -8,7 +8,9 @@ from sklearn.metrics import accuracy_score
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.models.svm import SVC
-from src.tools import load_flatten_mnist, notificar_fin_entrenamiento
+from src.tools import load_flatten_mnist
+
+from argos.callbacks import ArgosGuard
 
 if __name__ == "__main__":
     EPOCHS = 800
@@ -34,8 +36,11 @@ if __name__ == "__main__":
     # Train 45 SVM Models (One-vs-One)
     
     ovo_models = []
+    argos = ArgosGuard(prefix="SVC_test",check_memory=True)
 
     print("\nStarting One-vs-One training (45 models in total)...")
+
+    contador_modelos = 0
 
     # Nested loop to create all unique pairwise combinations without repetition
     for i in range(10):
@@ -65,7 +70,11 @@ if __name__ == "__main__":
             # Store a tuple with the model metadata: (positive, negative, model)
             ovo_models.append((i, j, svm_mlx))
 
-    notificar_fin_entrenamiento()
+            contador_modelos += 1
+            # Argos avisa cada 10 modelos para que sepas que sigue vivo
+            if contador_modelos % 10 == 0:
+                argos.send_heartbeat(f"Completados {contador_modelos}/45 modelos (One-vs-One).")
+
 
     
     # Prediction and Voting (One-vs-One)
@@ -84,6 +93,7 @@ if __name__ == "__main__":
         votes[np.arange(len(x_test))[preds == 1], i] += 1
         # If it predicted -1, add a point to the counter for digit 'j'
         votes[np.arange(len(x_test))[preds == -1], j] += 1
+        
 
     # The digit that accumulated the most votes for each image is the prediction
     final_predictions = np.argmax(votes, axis=1)
@@ -93,3 +103,4 @@ if __name__ == "__main__":
     print(
         f"\nProcess finished! Test Accuracy (One-vs-One): {accuracy * 100:.2f}%"
     )
+    argos.on_process_end(f"Test Accuracy: {accuracy * 100:.2f}%")
